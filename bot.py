@@ -5,6 +5,9 @@ import re
 import sqlite3
 import time
 import threading
+import traceback
+import html
+import json
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -75,14 +78,31 @@ def get_user_config(user_id: int) -> Dict:
             'blacklist': eval(row[6]) if row[6] else [],
             'whitelist': eval(row[7]) if row[7] else [],
             'user_filter': eval(row[8]) if row[8] else [],
-            'beginning_text': row[9],
-            'ending_text': row[10],
-            'delay': row[11],
+            'beginning_text': row[9] or '',
+            'ending_text': row[10] or '',
+            'delay': row[11] or 0,
             'edit_enabled': bool(row[12]),
             'delete_enabled': bool(row[13]),
-            'status': row[14]
+            'status': row[14] or 'STOPPED'
         }
-    return {}
+    # For new users, return defaults to avoid KeyError
+    return {
+        'user_id': user_id,
+        'phone': '',
+        'session': '',
+        'sources': [],
+        'destinations': [],
+        'replacements': {},
+        'blacklist': [],
+        'whitelist': [],
+        'user_filter': [],
+        'beginning_text': '',
+        'ending_text': '',
+        'delay': 0,
+        'edit_enabled': False,
+        'delete_enabled': False,
+        'status': 'STOPPED'
+    }
 
 def update_user_config(user_id: int, config: Dict):
     conn = sqlite3.connect(DB_FILE)
@@ -567,6 +587,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif not config.get('phone') and text.startswith('+') and text[1:].isdigit():
         await handle_phone(update, context)
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and optionally send to a dev chat."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = "".join(tb_list)
+
+    # Optional: Send to your dev chat ID (set as env var ADMIN_ID or hardcode for testing)
+    dev_chat_id = os.environ.get('ADMIN_ID')  # Your Telegram user ID
+    if dev_chat_id:
+        update_str = update.to_dict() if isinstance(update, Update) else str(update)
+        message = (
+            "An exception was raised while handling an update:\n"
+            f"<pre>update = {html.escape(json.dumps(update_str, indent=2, ensure_ascii=False))}</pre>\n\n"
+            f"<pre>{html.escape(tb_string)}</pre>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=int(dev_chat_id), text=message, parse_mode='HTML'
+            )
+        except:
+            pass  # Don't crash if send fails
+
 def main():
     token = os.environ['BOT_TOKEN']
     app = Application.builder().token(token).build()
@@ -595,11 +637,11 @@ def main():
     app.add_handler(CommandHandler("features", features))
     app.add_handler(CallbackQueryHandler(callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    app.add_error_handler(error_handler)
     # Start Flask in thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-
+    
     # Run bot
     app.run_polling()
 
