@@ -5,13 +5,13 @@ import re
 import sqlite3
 import time
 import threading
+from typing import Dict, List, Optional
+from datetime import datetime
 import traceback
 import html
 import json
-from typing import Dict, List, Optional
-from datetime import datetime
 
-from flask import Flask
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telethon import TelegramClient
@@ -28,6 +28,14 @@ flask_app = Flask(__name__)
 @flask_app.route('/health')
 def health():
     return 'OK', 200
+
+# Webhook endpoint (uncomment to use webhooks instead of polling)
+# @flask_app.route('/webhook', methods=['POST'])
+# async def webhook():
+#     json_string = await request.get_json()
+#     update = Update.de_json(json_string, app.bot)
+#     await app.process_update(update)
+#     return 'OK'
 
 def run_flask():
     flask_app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
@@ -85,7 +93,6 @@ def get_user_config(user_id: int) -> Dict:
             'delete_enabled': bool(row[13]),
             'status': row[14] or 'STOPPED'
         }
-    # For new users, return defaults to avoid KeyError
     return {
         'user_id': user_id,
         'phone': '',
@@ -125,8 +132,8 @@ async def get_client(user_id: int, config: Dict) -> Optional[TelegramClient]:
         return clients[user_id]
     if not config.get('session'):
         return None
-    api_id = os.environ.get('API_ID', 'YOUR_API_ID')  # Set in Koyeb env vars
-    api_hash = os.environ.get('API_HASH', 'YOUR_API_HASH')  # Set in Koyeb env vars
+    api_id = os.environ.get('API_ID', 'YOUR_API_ID')
+    api_hash = os.environ.get('API_HASH', 'YOUR_API_HASH')
     client = TelegramClient(f'sessions/{user_id}', api_id, api_hash)
     try:
         await client.connect()
@@ -139,23 +146,19 @@ async def get_client(user_id: int, config: Dict) -> Optional[TelegramClient]:
         return None
 
 # Forwarding logic
-message_id_maps: Dict[int, Dict] = {}  # Per user
+message_id_maps: Dict[int, Dict] = {}
 
 def apply_filters(text: str, config: Dict) -> Optional[str]:
     if not text:
         return text
-    # Blacklist check
     for pattern in config['blacklist']:
         if re.search(pattern, text, re.IGNORECASE):
             return None
-    # Whitelist check
     if config['whitelist']:
         if not any(re.search(pattern, text, re.IGNORECASE) for pattern in config['whitelist']):
             return None
-    # Text replacement
     for old, new in config['replacements'].items():
         text = re.sub(old, new, text, flags=re.IGNORECASE)
-    # Add beginning/ending
     if config['beginning_text']:
         text = config['beginning_text'] + '\n' + text
     if config['ending_text']:
@@ -170,7 +173,6 @@ async def forward_message(client: TelegramClient, update, config: Dict, context:
         message = update.message
     if not message or message.chat_id not in config['sources']:
         return
-    # User filter
     if config['user_filter'] and message.from_id and message.from_id.user_id not in config['user_filter']:
         return
     text = message.message or ''
@@ -190,7 +192,6 @@ async def forward_message(client: TelegramClient, update, config: Dict, context:
                 sent_msg = await client.send_message(dest_id, filtered_text or text)
             else:
                 continue
-            # Store for edit/delete
             if config['edit_enabled'] or config['delete_enabled']:
                 user_id = config['user_id']
                 if user_id not in message_id_maps:
@@ -237,11 +238,10 @@ async def handle_delete(client: TelegramClient, update: UpdateDeleteMessages, co
                 except:
                     pass
 
-# Telethon event handler
 async def telethon_handler(event, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT user_id, session FROM users WHERE ? IN (eval(sources)) AND status = "RUNNING"', (event.chat_id,))
+    c.execute('SELECT user_id, session FROM users WHERE ? IN (eval(sources)) AND status = "RUNNING"', (event.chat_id))
     users = c.fetchall()
     conn.close()
     for user_id, _ in users:
@@ -256,7 +256,35 @@ async def telethon_handler(event, context: ContextTypes.DEFAULT_TYPE):
         elif isinstance(event, UpdateDeleteMessages):
             await handle_delete(client, event, config)
 
-# Commands
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    if isinstance(context.error, telegram.error.Conflict):
+        logger.warning("Polling conflict detected. Ensure only one instance is running.")
+        dev_chat_id = os.environ.get('ADMIN_ID')
+        if dev_chat_id:
+            try:
+                await context.bot.send_message(
+                    int(dev_chat_id), "Bot conflict: Only one instance should run. Check Koyeb deploys."
+                )
+            except:
+                pass
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = "".join(tb_list)
+    dev_chat_id = os.environ.get('ADMIN_ID')
+    if dev_chat_id:
+        update_str = update.to_dict() if isinstance(update, Update) else str(update)
+        message = (
+            "An exception was raised while handling an update:\n"
+            f"<pre>update = {html.escape(json.dumps(update_str, indent=2, ensure_ascii=False))}</pre>\n\n"
+            f"<pre>{html.escape(tb_string)}</pre>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=int(dev_chat_id), text=message, parse_mode='HTML'
+            )
+        except:
+            pass
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text("Welcome to Auto Forwarder Bot! Use /authorize to log in with your phone number. Pin source/destination chats for easy selection. Check /features.")
@@ -347,7 +375,7 @@ async def list_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Not logged in. Use /authorize.")
         return
     chats = []
-    async for dialog in client.iter_dialogs(limit=20):  # Top 20 as pinned approximation
+    async for dialog in client.iter_dialogs(limit=20):
         chats.append((dialog.id, dialog.title))
     if not chats:
         await update.message.reply_text("No chats found. Join some and pin them.")
@@ -523,7 +551,6 @@ async def work_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config['status'] = 'RUNNING'
     update_user_config(user_id, config)
     await update.message.reply_text('Forwarding started! /stop to stop.')
-    # Start Telethon event listener if not already running
     if user_id not in clients:
         clients[user_id] = client
         client.add_event_handler(lambda event: telethon_handler(event, context), Updates)
@@ -577,7 +604,6 @@ async def features(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Commands: /authorize, /incoming, /outgoing, /list_chats, /filter, /blacklist, /whitelist, /userfilter, /beginning_text, /ending_text, /delay, /should_edit, /should_delete, /config, /work, /stop, /remove_session, /delete_config"""
     await update.message.reply_text(msg)
 
-# Message handler for phone/code
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     config = get_user_config(user_id)
@@ -587,33 +613,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif not config.get('phone') and text.startswith('+') and text[1:].isdigit():
         await handle_phone(update, context)
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and optionally send to a dev chat."""
-    logger.error("Exception while handling an update:", exc_info=context.error)
-    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-    tb_string = "".join(tb_list)
-
-    # Optional: Send to your dev chat ID (set as env var ADMIN_ID or hardcode for testing)
-    dev_chat_id = os.environ.get('ADMIN_ID')  # Your Telegram user ID
-    if dev_chat_id:
-        update_str = update.to_dict() if isinstance(update, Update) else str(update)
-        message = (
-            "An exception was raised while handling an update:\n"
-            f"<pre>update = {html.escape(json.dumps(update_str, indent=2, ensure_ascii=False))}</pre>\n\n"
-            f"<pre>{html.escape(tb_string)}</pre>"
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=int(dev_chat_id), text=message, parse_mode='HTML'
-            )
-        except:
-            pass  # Don't crash if send fails
-
 def main():
     token = os.environ['BOT_TOKEN']
+    global app  # Needed for webhook if enabled
     app = Application.builder().token(token).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("authorize", authorize))
     app.add_handler(CommandHandler("password", password))
@@ -638,12 +642,21 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    # Start Flask in thread
+
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    
-    # Run bot
-    app.run_polling()
+
+    # Polling with conflict prevention
+    app.run_polling(drop_pending_updates=True, timeout=10, bootstrap_retries=-1)
+
+    # Webhook alternative (uncomment to use)
+    # webhook_url = 'https://your-app.koyeb.app/webhook'  # Replace with your Koyeb URL
+    # app.run_webhook(
+    #     listen='0.0.0.0',
+    #     port=int(os.environ.get('PORT', 8000)),
+    #     url_path='/webhook',
+    #     webhook_url=webhook_url
+    # )
 
 if __name__ == '__main__':
     main()
