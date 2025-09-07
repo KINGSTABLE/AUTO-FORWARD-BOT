@@ -591,7 +591,7 @@ def main():
     app.add_handler(CommandHandler("work", work_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("remove_session", remove_session))
-    app.add_handler(CommandLoginHandler("delete_config", delete_config))
+    app.add_handler(CommandHandler("delete_config", delete_config))
     app.add_handler(CommandHandler("features", features))
     app.add_handler(CallbackQueryHandler(callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
